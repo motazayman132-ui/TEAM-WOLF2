@@ -1,176 +1,209 @@
-# ==============================================================================
-# المشروع: بوت RMOT الصوتي - الإصدار الرابع (Modal & Admin System)
-# الوصف: لوحة تحكم إدارية بنظام النوافذ المنبثقة لإرسال التحذيرات والإعلانات في الخاص
-# المميزات: صوت 24/7، منشن إدارة، نوافذ إدخال بيانات، إرسال تلقائي للخاص
-# ==============================================================================
-
 import discord
 from discord.ext import commands, tasks
-from discord.ui import Button, View, Modal, TextInput
+from discord import app_commands
 import asyncio
-import os
-import datetime
-from dotenv import load_dotenv
+import json
+import time
 
-load_dotenv()
-TOKEN = os.getenv("TOKEN")
+TOKEN = "PUT_YOUR_TOKEN_HERE"
 
-# ------------------------------------------------------------------------------
-# [1] إعدادات الربط والتشغيل (Configuration)
-# ------------------------------------------------------------------------------
-VOICE_ID = 1466581684290850984
-STAFF_CHANNEL_ID = 1467779526351392880
-STAFF_ROLE_ID = 1466572944166883461
-AUDIO_FILE = "support.mp3"
-PANEL_IMAGE = "POT.png"
+LOG_CHANNEL_ID = 1483891442920456263
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
-intents.guilds = True
-intents.members = True
+# الرتب
+ROLES = {
+    "warn1": 1475095531389714604,
+    "warn2": 1475097777104097545,
+    "warn3": 1475098153421377567,
+    "disc1": 1473015121906368715,
+    "disc2": 1473015122753749012,
+    "timeout": 1473015129019908232
+}
 
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+# مدة العقوبات (بالثواني)
+DURATIONS = {
+    "warn1": 5 * 24 * 3600,
+    "warn2": 7 * 24 * 3600,
+    "warn3": 14 * 24 * 3600,
+    "disc1": 7 * 24 * 3600,
+    "disc2": 14 * 24 * 3600,
+    "timeout": 7 * 24 * 3600
+}
 
-# ------------------------------------------------------------------------------
-# [2] نوافذ إدخال البيانات (Modals System)
-# ------------------------------------------------------------------------------
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-class WarningModal(Modal, title="إصدار تحذير رسمي"):
-    user_id = TextInput(label="آيدي العضو المعني", placeholder="أدخل ID العضو هنا...", min_length=15)
-    reason = TextInput(label="سبب التحذير", style=discord.TextStyle.paragraph, placeholder="اكتب السبب بوضوح...")
+punishments = {}
 
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            user = await bot.fetch_user(int(self.user_id.value))
-            embed = discord.Embed(title="⚠️ تحذير رسمي من الإدارة", description=f"تم إصدار تحذير بحقك بسبب:\n**{self.reason.value}**", color=0xff0000)
-            await user.send(embed=embed)
-            await interaction.response.send_message(f"✅ تم إرسال التحذير للعضو {user.name} في الخاص.", ephemeral=True)
-        except:
-            await interaction.response.send_message("❌ فشل الإرسال! تأكد من الآيدي أو أن العضو مغلق الخاص.", ephemeral=True)
+# تحميل البيانات
+try:
+    with open("punishments.json", "r") as f:
+        punishments = json.load(f)
+except:
+    punishments = {}
 
-class AnnouncementModal(Modal, title="نشر إعلان رتبة"):
-    role_id = TextInput(label="آيدي الرتبة المستهدفة", placeholder="أدخل ID الرتبة هنا...", min_length=15)
-    message = TextInput(label="نص الإعلان", style=discord.TextStyle.paragraph, placeholder="اكتب الإعلان الذي سيصلهم في الخاص...")
+def save_data():
+    with open("punishments.json", "w") as f:
+        json.dump(punishments, f)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.send_message("⏳ جاري البدء في عملية النشر التلقائي للرتبة...", ephemeral=True)
-        role = interaction.guild.get_role(int(self.role_id.value))
-        if not role:
-            return await interaction.followup.send("❌ آيدي الرتبة غير صحيح!", ephemeral=True)
+# ================= UI =================
 
-        count = 0
-        for member in role.members:
-            try:
-                embed = discord.Embed(title="📢 إعلان هام", description=self.message.value, color=0x00ff00)
-                await member.send(embed=embed)
-                count += 1
-            except:
-                continue
-        await interaction.followup.send(f"✅ تم الانتهاء! وصل الإعلان لـ {count} عضو في الخاص.", ephemeral=True)
+class PunishmentMenu(discord.ui.Select):
+    def __init__(self, member, moderator):
+        self.member = member
+        self.moderator = moderator
 
-# ------------------------------------------------------------------------------
-# [3] لوحة التحكم RMOT (الأزرار والتحكم)
-# ------------------------------------------------------------------------------
+        options = [
+            discord.SelectOption(label="القذف", description="إنذار دسكورد أول + ثاني + تايم أوت أسبوع"),
+            discord.SelectOption(label="السب", description="تحذير أول + تحذير ثاني"),
+            discord.SelectOption(label="تسحيب", description="باند نهائي"),
+            discord.SelectOption(label="تسحيب متكرر", description="إنذار دسكورد أول + ثاني"),
+            discord.SelectOption(label="إساءة استخدام الإدارة", description="كسر رتبة"),
+        ]
 
-class ControlPanel(View):
-    def __init__(self):
+        super().__init__(placeholder="اختر نوع العقوبة...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+
+        guild = interaction.guild
+        member = self.member
+
+        def add_role(role_key):
+            role = guild.get_role(ROLES[role_key])
+            if role:
+                asyncio.create_task(member.add_roles(role))
+
+                end_time = int(time.time()) + DURATIONS[role_key]
+
+                if str(member.id) not in punishments:
+                    punishments[str(member.id)] = []
+
+                punishments[str(member.id)].append({
+                    "role": role_key,
+                    "end": end_time
+                })
+
+                save_data()
+
+        # === العقوبات ===
+
+        if self.values[0] == "القذف":
+            add_role("disc1")
+            add_role("disc2")
+            add_role("timeout")
+
+            await member.timeout(discord.utils.utcnow() + discord.timedelta(days=7))
+
+        elif self.values[0] == "السب":
+            add_role("warn1")
+            add_role("warn2")
+
+        elif self.values[0] == "تسحيب":
+            await member.ban(reason="تسحيب")
+
+        elif self.values[0] == "تسحيب متكرر":
+            add_role("disc1")
+            add_role("disc2")
+
+        elif self.values[0] == "إساءة استخدام الإدارة":
+            await member.edit(roles=[])
+
+        # === لوق ===
+        log = bot.get_channel(LOG_CHANNEL_ID)
+        if log:
+            await log.send(f"📢 تم معاقبة {member.mention} بواسطة {self.moderator.mention}\nالسبب: {self.values[0]}")
+
+        await interaction.response.send_message("✅ تم تنفيذ العقوبة", ephemeral=True)
+
+
+class PunishmentView(discord.ui.View):
+    def __init__(self, member, moderator):
         super().__init__(timeout=None)
+        self.add_item(PunishmentMenu(member, moderator))
 
-    @discord.ui.button(label="إعلان 📢", style=discord.ButtonStyle.green, custom_id="m_ann")
-    async def announcement(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AnnouncementModal())
 
-    @discord.ui.button(label="تحذير ⚠️", style=discord.ButtonStyle.red, custom_id="m_warn")
-    async def warning(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(WarningModal())
+# ================= COMMAND =================
 
-    @discord.ui.button(label="طرد 👢", style=discord.ButtonStyle.red, custom_id="m_kick")
-    async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("👢 نظام الطرد اليدوي: يرجى استخدام الأمر الإداري المباشر.", ephemeral=True)
+@bot.tree.command(name="عقوبة", description="إعطاء عقوبة لعضو")
+@app_commands.describe(member="اختر العضو")
+async def punish(interaction: discord.Interaction, member: discord.Member):
 
-    @discord.ui.button(label="تنبيه 🔔", style=discord.ButtonStyle.blurple, custom_id="m_alert")
-    async def alert(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔔 تم تفعيل نظام التنبيهات السريع.", ephemeral=True)
+    embed = discord.Embed(
+        title="📋 نظام العقوبات",
+        description="اختر نوع المخالفة من القائمة بالأسفل",
+        color=discord.Color.red()
+    )
 
-    @discord.ui.button(label="رتبة 🏅", style=discord.ButtonStyle.grey, custom_id="m_role")
-    async def role(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🏅 يرجى الانتظار في الروم الصوتي ليتم تسليمك الرتبة.", ephemeral=True)
+    embed.set_image(url="PUT_IMAGE_LINK_HERE")  # حط الصورة هون
 
-    @discord.ui.button(label="معلومات ℹ️", style=discord.ButtonStyle.blurple, custom_id="m_info")
-    async def info(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("ℹ️ RMOT V4: نظام التحكم الصوتي والإداري المتكامل.", ephemeral=True)
+    await interaction.response.send_message(
+        embed=embed,
+        view=PunishmentView(member, interaction.user)
+    )
 
-    @discord.ui.button(label="إعادة اتصال صوتي 🔄", style=discord.ButtonStyle.blurple, custom_id="m_recon")
-    async def reconnect(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔄 جاري تحديث اتصال البوت الصوتي...", ephemeral=True)
 
-# ------------------------------------------------------------------------------
-# [4] نظام الصوت والبقاء 24/7
-# ------------------------------------------------------------------------------
+# ================= إزالة الرتب تلقائي =================
+
+@tasks.loop(seconds=60)
+async def check_punishments():
+    now = int(time.time())
+
+    for user_id in list(punishments.keys()):
+        member_data = punishments[user_id]
+        guild = bot.guilds[0]
+        member = guild.get_member(int(user_id))
+
+        if not member:
+            continue
+
+        new_list = []
+
+        for p in member_data:
+            if now >= p["end"]:
+                role = guild.get_role(ROLES[p["role"]])
+                if role:
+                    await member.remove_roles(role)
+            else:
+                new_list.append(p)
+
+        punishments[user_id] = new_list
+
+    save_data()
+
+
+# ================= منع abuse الإدارة =================
+
+action_counter = {}
+
+@bot.event
+async def on_member_update(before, after):
+
+    if before.mute != after.mute or before.deaf != after.deaf:
+
+        mod = after.guild.get_member(after.id)
+
+        if not mod.guild_permissions.moderate_members:
+            return
+
+        if mod.id not in action_counter:
+            action_counter[mod.id] = []
+
+        action_counter[mod.id].append(time.time())
+
+        # خلال 10 ثواني أكثر من 5 مرات
+        action_counter[mod.id] = [t for t in action_counter[mod.id] if time.time() - t < 10]
+
+        if len(action_counter[mod.id]) >= 5:
+            await mod.timeout(discord.utils.utcnow() + discord.timedelta(minutes=5))
+            action_counter[mod.id] = []
+
+
+# ================= READY =================
 
 @bot.event
 async def on_ready():
-    print("✅ نظام RMOT V4 متصل وجاهز للعمل!")
-    stay_in_voice.start()
+    await bot.tree.sync()
+    check_punishments.start()
+    print(f"Bot Ready: {bot.user}")
 
-@tasks.loop(seconds=15)
-async def stay_in_voice():
-    channel = bot.get_channel(VOICE_ID)
-    if not channel:
-        return
-    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
-    if not vc or not vc.is_connected():
-        try:
-            await channel.connect(reconnect=True)
-        except:
-            pass
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.bot:
-        return
-    if after.channel and after.channel.id == VOICE_ID:
-        if before.channel is None or before.channel.id != VOICE_ID:
-            staff_ch = bot.get_channel(STAFF_CHANNEL_ID)
-            if staff_ch:
-                await staff_ch.send(f"🚨 <@&{STAFF_ROLE_ID}>، العضو **{member.name}** دخل الانتظار!")
-            vc = discord.utils.get(bot.voice_clients, guild=member.guild)
-            if vc and vc.is_connected():
-                if vc.is_playing():
-                    vc.stop()
-                vc.play(discord.FFmpegPCMAudio(AUDIO_FILE))
-
-# ------------------------------------------------------------------------------
-# [5] أنظمة الأوامر (Help & Panel)
-# ------------------------------------------------------------------------------
-
-@bot.command(name='مساعدة')
-async def show_panel(ctx):
-    if any(role.id == STAFF_ROLE_ID for role in ctx.author.roles):
-        embed = discord.Embed(
-            title="🛡️ لوحة التحكم الإدارية الكبرى",
-            description="**الصوتي RMOT نظام 4**\n\nاضغط على الأزرار لفتح نوافذ التحكم والإرسال التلقائي للخاص.",
-            color=0x2b2d31
-        )
-        if os.path.exists(PANEL_IMAGE):
-            file = discord.File(PANEL_IMAGE, filename="p.png")
-            embed.set_image(url="attachment://p.png")
-            await ctx.send(file=file, embed=embed, view=ControlPanel())
-        else:
-            await ctx.send(embed=embed, view=ControlPanel())
-    else:
-        await ctx.send("❌ للإدارة فقط!")
-
-@bot.command(name='هيلب')
-async def manual(ctx):
-    guide = discord.Embed(title="📚 دليل تشغيل بوت RMOT V4", color=0x00ff00)
-    guide.add_field(name="❓ زر التحذير", value="يفتح لك نافذة تطلب منك آيدي العضو والسبب، ثم يرسل له البوت في الخاص مباشرة.", inline=False)
-    guide.add_field(name="❓ زر الإعلان", value="يطلب منك آيدي الرتبة، ويرسل الإعلان لكل أعضاء هذه الرتبة في الخاص تلقائياً.", inline=False)
-    guide.add_field(name="❓ النظام الصوتي", value="البوت يدخل الروم 24/7 ويشغل صوت ترحيبي ويمنشن الإدارة فور دخول عضو.", inline=False)
-    await ctx.send(embed=guide)
-
-if not TOKEN:
-    raise ValueError("TOKEN not found in environment variables")
 
 bot.run(TOKEN)
